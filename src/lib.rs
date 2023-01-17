@@ -1,59 +1,6 @@
 use std::rc::Rc;
 use std::{collections::HashMap, fmt, io, num::ParseFloatError};
 
-fn tokenize(expr: &str) -> Vec<String> {
-    expr.replace('(', " ( ")
-        .replace(')', " ) ")
-        .split_whitespace()
-        .map(|x| x.to_owned())
-        .collect()
-}
-
-fn parse(tokens: &[String]) -> Result<RispExp, RispErr> {
-    Ok(__parse(tokens)?.0)
-}
-
-fn __parse(tokens: &[String]) -> Result<(RispExp, &[String]), RispErr> {
-    let (token, rest) = tokens
-        .split_first()
-        .ok_or(RispErr::Reason("could not get token".to_string()))?;
-    match &token[..] {
-        "(" => read_seq(rest),
-        ")" => Err(RispErr::Reason("unexpected `)`".to_string())),
-        _ => Ok((parse_atom(token), rest)),
-    }
-}
-
-fn read_seq(tokens: &[String]) -> Result<(RispExp, &[String]), RispErr> {
-    let mut res: Vec<RispExp> = vec![];
-    let mut xs = tokens;
-    loop {
-        let (next_token, rest) = xs
-            .split_first()
-            .ok_or(RispErr::Reason("could not find closing `)`".to_string()))?;
-        if next_token == ")" {
-            return Ok((RispExp::List(res), rest)); // skip `)`, head to the token after
-        }
-        let (exp, new_xs) = __parse(&xs)?;
-        res.push(exp);
-        xs = new_xs;
-    }
-}
-
-fn parse_atom(token: &str) -> RispExp {
-    match token.as_ref() {
-        "true" => RispExp::Bool(true),
-        "false" => RispExp::Bool(false),
-        _ => {
-            let potential_float: Result<f64, ParseFloatError> = token.parse();
-            match potential_float {
-                Ok(v) => RispExp::Number(v),
-                Err(_) => RispExp::Symbol(token.to_string()),
-            }
-        }
-    }
-}
-
 #[derive(Clone)]
 pub enum RispExp {
     Bool(bool),
@@ -131,52 +78,174 @@ macro_rules! ensure_tonicity {
     }};
 }
 
-pub fn default_env<'a>() -> RispEnv<'a> {
-    let mut data: HashMap<String, RispExp> = HashMap::new();
-    data.insert(
-        "+".to_string(),
-        RispExp::Func(|args: &[RispExp]| -> Result<RispExp, RispErr> {
-            let sum = parse_list_of_floats(args)?
-                .iter()
-                .fold(0.0, |sum, a| sum + a);
+pub struct LispParser<'parser> {
+    env: RispEnv<'parser>,
+}
 
-            Ok(RispExp::Number(sum))
-        }),
-    );
-    data.insert(
-        "-".to_string(),
-        RispExp::Func(|args: &[RispExp]| -> Result<RispExp, RispErr> {
-            let floats = parse_list_of_floats(args)?;
-            let first = *floats
-                .first()
-                .ok_or_else(|| RispErr::Reason("expected at least one number".to_string()))?;
-            let sum_of_rest = floats[1..].iter().fold(0.0, |sum, a| sum + a);
+impl<'parser> LispParser<'parser> {
+    pub fn new() -> Self {
+        let env = Self::default_env();
+        Self { env }
+    }
 
-            Ok(RispExp::Number(first - sum_of_rest))
-        }),
-    );
-    data.insert(
-        "=".to_string(),
-        RispExp::Func(ensure_tonicity!(|a, b| a == b)),
-    );
-    data.insert(
-        ">".to_string(),
-        RispExp::Func(ensure_tonicity!(|a, b| a > b)),
-    );
-    data.insert(
-        ">=".to_string(),
-        RispExp::Func(ensure_tonicity!(|a, b| a >= b)),
-    );
-    data.insert(
-        "<".to_string(),
-        RispExp::Func(ensure_tonicity!(|a, b| a < b)),
-    );
-    data.insert(
-        "<=".to_string(),
-        RispExp::Func(ensure_tonicity!(|a, b| a <= b)),
-    );
+    fn eval(&mut self, exp: &RispExp) -> Result<RispExp, RispErr> {
+        match exp {
+            RispExp::Bool(_) => Ok(exp.clone()),
+            RispExp::Symbol(symbol) => env_get(symbol, &mut self.env)
+                .ok_or(RispErr::Reason(format!("unexpected symbol k='{}'", symbol))),
+            RispExp::Number(_a) => Ok(exp.clone()),
+            RispExp::List(list) => {
+                let first_form = list
+                    .first()
+                    .ok_or_else(|| RispErr::Reason("expected a non-empty list".to_string()))?;
+                let arg_forms = &list[1..];
+                match eval_built_in_form(first_form, arg_forms, &mut self.env) {
+                    Some(res) => res,
+                    None => {
+                        let first_eval = eval(first_form, &mut self.env)?;
+                        match first_eval {
+                            RispExp::Func(f) => f(&eval_forms(arg_forms, &mut self.env)?),
+                            RispExp::Lambda(lambda) => {
+                                let new_env = &mut env_for_lambda(
+                                    lambda.params_exp,
+                                    arg_forms,
+                                    &mut self.env,
+                                )?;
+                                self.eval(&lambda.body_exp)
+                            }
+                            _ => Err(RispErr::Reason("first form must be a function".to_string())),
+                        }
+                    }
+                }
+            }
+            RispExp::Func(_) => todo!(),
+            RispExp::Lambda(_) => todo!(),
+        }
+    }
 
-    RispEnv { data, outer: None }
+    fn eval_built_in_form(
+        &mut self,
+        exp: &RispExp,
+        arg_forms: &[RispExp],
+    ) -> Option<Result<RispExp, RispErr>> {
+        match exp {
+            RispExp::Symbol(s) => match s.as_ref() {
+                "if" => Some(eval_if_args(arg_forms, &mut self.env)),
+                "def" => Some(eval_def_args(arg_forms, &mut self.env)),
+                "fn" => Some(eval_lambda_args(arg_forms)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn parse_eval(&mut self, expr: String) -> Result<RispExp, RispErr> {
+        let parsed_exp = Self::parse(&Self::tokenize(&expr))?;
+        let evaled_exp = self.eval(&parsed_exp)?;
+
+        Ok(evaled_exp)
+    }
+
+    fn tokenize(expr: &str) -> Vec<String> {
+        expr.replace('(', " ( ")
+            .replace(')', " ) ")
+            .split_whitespace()
+            .map(|x| x.to_owned())
+            .collect()
+    }
+
+    fn default_env() -> RispEnv<'parser> {
+        let mut data: HashMap<String, RispExp> = HashMap::new();
+        data.insert(
+            "+".to_string(),
+            RispExp::Func(|args: &[RispExp]| -> Result<RispExp, RispErr> {
+                let sum = parse_list_of_floats(args)?
+                    .iter()
+                    .fold(0.0, |sum, a| sum + a);
+
+                Ok(RispExp::Number(sum))
+            }),
+        );
+        data.insert(
+            "-".to_string(),
+            RispExp::Func(|args: &[RispExp]| -> Result<RispExp, RispErr> {
+                let floats = parse_list_of_floats(args)?;
+                let first = *floats
+                    .first()
+                    .ok_or_else(|| RispErr::Reason("expected at least one number".to_string()))?;
+                let sum_of_rest = floats[1..].iter().fold(0.0, |sum, a| sum + a);
+
+                Ok(RispExp::Number(first - sum_of_rest))
+            }),
+        );
+        data.insert(
+            "=".to_string(),
+            RispExp::Func(ensure_tonicity!(|a, b| a == b)),
+        );
+        data.insert(
+            ">".to_string(),
+            RispExp::Func(ensure_tonicity!(|a, b| a > b)),
+        );
+        data.insert(
+            ">=".to_string(),
+            RispExp::Func(ensure_tonicity!(|a, b| a >= b)),
+        );
+        data.insert(
+            "<".to_string(),
+            RispExp::Func(ensure_tonicity!(|a, b| a < b)),
+        );
+        data.insert(
+            "<=".to_string(),
+            RispExp::Func(ensure_tonicity!(|a, b| a <= b)),
+        );
+
+        RispEnv { data, outer: None }
+    }
+
+    pub fn parse(tokens: &[String]) -> Result<RispExp, RispErr> {
+        Ok(Self::m_parse(tokens)?.0)
+    }
+
+    fn m_parse(tokens: &[String]) -> Result<(RispExp, &[String]), RispErr> {
+        let (token, rest) = tokens
+            .split_first()
+            .ok_or(RispErr::Reason("could not get token".to_string()))?;
+        match &token[..] {
+            "(" => Self::read_seq(rest),
+            ")" => Err(RispErr::Reason("unexpected `)`".to_string())),
+            _ => Ok((Self::parse_atom(token), rest)),
+        }
+    }
+
+    fn read_seq(tokens: &[String]) -> Result<(RispExp, &[String]), RispErr> {
+        let mut res: Vec<RispExp> = vec![];
+        let mut xs = tokens;
+        loop {
+            let (next_token, rest) = xs
+                .split_first()
+                .ok_or(RispErr::Reason("could not find closing `)`".to_string()))?;
+            if next_token == ")" {
+                return Ok((RispExp::List(res), rest)); // skip `)`, head to the token after
+            }
+            let (exp, new_xs) = Self::m_parse(&xs)?;
+            res.push(exp);
+            xs = new_xs;
+        }
+    }
+
+    fn parse_atom(token: &str) -> RispExp {
+        match token.as_ref() {
+            "true" => RispExp::Bool(true),
+            "false" => RispExp::Bool(false),
+            _ => {
+                let potential_float: Result<f64, ParseFloatError> = token.parse();
+                match potential_float {
+                    Ok(v) => RispExp::Number(v),
+                    Err(_) => RispExp::Symbol(token.to_string()),
+                }
+            }
+        }
+    }
 }
 
 fn eval_built_in_form(
@@ -345,13 +414,6 @@ fn eval(exp: &RispExp, env: &mut RispEnv) -> Result<RispExp, RispErr> {
     }
 }
 
-pub fn parse_eval(expr: String, env: &mut RispEnv) -> Result<RispExp, RispErr> {
-    let parsed_exp = parse(&tokenize(&expr))?;
-    let evaled_exp = eval(&parsed_exp, env)?;
-
-    Ok(evaled_exp)
-}
-
 pub fn slurp_expr() -> String {
     let mut expr = String::new();
 
@@ -385,8 +447,9 @@ mod tests {
             "(+ (- 10 3 3) (- 10 3 3) 10 5 )".to_owned(),
             "(+ 1 1 (- 2 2 (+ 3 3) (+ 4 4) ) (+ 1 1 (+ 1 1 (- 1 1))) )".to_owned(),
         ];
+        let mut parser = LispParser::new();
         for expr in exprs.into_iter() {
-            let _parsed_exp = parse(&tokenize(&expr)).unwrap();
+            // let _parsed_exp = parse(&tokenize(&expr)).unwrap();
         }
     }
 }
